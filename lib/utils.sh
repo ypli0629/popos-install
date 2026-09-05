@@ -19,7 +19,7 @@ check_sudo() {
     if ! sudo -v 2>/dev/null; then
         log_error "需要 sudo 权限" fatal
     fi
-    # 确保 curl/wget 可用（Debian 最小安装不自带）
+    # 确保 curl/wget 可用（最小化安装的系统可能不自带）
     local _missing=()
     command -v curl &>/dev/null || _missing+=(curl)
     command -v wget &>/dev/null || _missing+=(wget)

@@ -34,8 +34,11 @@ else
 fi
 
 log_section "Homebrew 软件包"
-brew install --cask font-sauce-code-pro-nerd-font
+# 字体 cask 失败不应阻断后续开发工具安装
+brew install --cask font-sauce-code-pro-nerd-font \
+    || record_failure "SauceCodePro Nerd Font"
 brew install gcc go rustup node pnpm yarn neovim bear fzf mycli \
-    lazydocker jq mkcert xh
+    lazydocker jq mkcert xh \
+    || record_failure "brew 软件包（部分失败，可手动重试）"
 
 log_success "brew 完成"

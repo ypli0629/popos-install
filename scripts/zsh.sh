@@ -46,8 +46,14 @@ for plugin in zsh-autosuggestions zsh-syntax-highlighting; do
 done
 
 log_section "zshrc 配置"
-append_zshrc_once "# >>> debian13-install >>>" "$(cat <<'EOF'
-# >>> debian13-install >>>
+# 迁移旧标记（原 debian13-install 仓库时代写入的配置块）
+if grep -qF '>>> debian13-install >>>' ~/.zshrc 2>/dev/null; then
+    sed -i -e 's/>>> debian13-install >>>/>>> popos-install >>>/' \
+           -e 's/<<< debian13-install <<</<<< popos-install <<</' ~/.zshrc
+    log_info "已将 ~/.zshrc 旧标记 debian13-install 迁移为 popos-install"
+fi
+append_zshrc_once "# >>> popos-install >>>" "$(cat <<'EOF'
+# >>> popos-install >>>
 alias szsh="source ~/.zshrc"
 alias nzsh="nvim ~/.zshrc"
 alias pon="export http_proxy=http://127.0.0.1:7890; export https_proxy=http://127.0.0.1:7890; export all_proxy=socks5://127.0.0.1:7890"
@@ -58,7 +64,7 @@ ___MY_VMOPTIONS_SHELL_FILE="${HOME}/.jetbrains.vmoptions.sh"; if [ -f "${___MY_V
 
 # fzf shell 集成：Ctrl+R 历史搜索 / Ctrl+T 文件搜索 / Alt+C 目录跳转
 command -v fzf &>/dev/null && eval "$(fzf --zsh)"
-# <<< debian13-install <<<
+# <<< popos-install <<<
 EOF
 )"
 

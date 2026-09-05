@@ -1,173 +1,175 @@
 #!/bin/bash
+# ─────────────────────────────────────────────────────────────────────
+# kernel.sh — Pop!_OS 内核降级脚本（Ubuntu noble 6.8 GA 内核）
+#
+# 背景：kernel ≥ 6.11 与 NVIDIA Open 内核模块存在交互回归——
+#   睡眠唤醒失败（假死后只能硬关机）、重启/关机在末段挂死
+#   （journal 停在 "Sending SIGTERM"，对应 NVIDIA open-gpu-kernel-modules
+#   #1117/#1027，NVIDIA 内部跟踪号 6120895）。6.10 及以下不受影响。
+#   6.8.0-xxx 是 Ubuntu 24.04 官方持续维护（含安全更新）的最后一个
+#   < 6.11 内核系列。
+#
+# 流程：探测仓库最新 6.8 → 预先给 System76 DKMS 模块加内核版本门槛
+#   （其源码使用 6.11+ API，直接装会在 6.8 上编译失败导致 apt 半配置
+#   状态；这些模块在非 System76 机器上本就无用）→ 安装 6.8 → 校验
+#   NVIDIA DKMS → 清理多余 7.x 内核腾出 kernelstub 的 oldkern 槽位 →
+#   将 6.8 设为 systemd-boot 默认引导。
+#
+# 仅适用于 Pop!_OS（systemd-boot + kernelstub）；Debian/GRUB 不适用。
+# ─────────────────────────────────────────────────────────────────────
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/utils.sh"
 
 check_sudo
+export DEBIAN_FRONTEND=noninteractive
 
-GRUB_CFG="/boot/grub/grub.cfg"
-GRUB_DEFAULT_FILE="/etc/default/grub"
+# ── 环境检查 ─────────────────────────────────────────────────────────
+grep -q '^ID=pop' /etc/os-release 2>/dev/null \
+    || log_error "本脚本仅适用于 Pop!_OS（当前系统不符），Debian/GRUB 请勿使用" fatal
+# ESP 为 root-only（dmask=0077），须用 sudo test 探测
+sudo test -d /boot/efi/loader \
+    || log_error "未检测到 systemd-boot ESP（/boot/efi/loader），环境不符" fatal
 
-# ── 探测 kernel.ubuntu.com 可用协议 ───────────────────────
-# 部分 Debian 环境下 CA 证书不信任 Canonical，TLS 握手失败，回退 HTTP
-if curl -fsSL --connect-timeout 10 "https://kernel.ubuntu.com/mainline/" -o /dev/null 2>/dev/null; then
-    MAINLINE_BASE="https://kernel.ubuntu.com/mainline"
+# ── 探测 Ubuntu noble 仓库中最新的 6.8.x 内核 ────────────────────────
+# 注意：Pop /release 仓库（优先级 1001）把 linux-image-generic 劫持为
+# 7.x，不能直接取 apt 候选版本，须从 madison 输出中筛选 Ubuntu 源的 6.8
+log_section "探测 Ubuntu noble 仓库最新 6.8 内核"
+
+sudo apt-get update -qq
+CAND=$(apt-cache madison linux-image-generic \
+    | awk -F'|' '{gsub(/ /, "", $2); print $2}' | grep -E '^6\.8\.0-' | sort -V | tail -1)
+[[ -n "$CAND" ]] || log_error "Ubuntu 源中未找到 6.8.x 内核（linux-image-generic）" fatal
+
+# 从该版本 meta 的 Depends 中解析具体内核包名（首个依赖带尾逗号，需去掉）
+META_DEP=$(apt-cache show "linux-image-generic=${CAND}" | awk '/^Depends:/{sub(/,$/, "", $2); print $2; exit}')
+TARGET_REL=${META_DEP#linux-image-}
+[[ "$TARGET_REL" =~ ^6\.8\.0-[0-9]+-generic$ ]] \
+    || log_error "探测到非预期的内核版本：${TARGET_REL:-空}（应为 6.8.0-xxx-generic）" fatal
+log_info "目标内核：${TARGET_REL}（来自 linux-image-generic ${CAND}）"
+
+# ── 预防性修补：System76 DKMS 模块跳过 <6.11 内核 ────────────────────
+# 其源码使用 6.11+ 内核 API（platform_driver .remove 改 void、
+# LED_REJECT_NAME_CONFLICT 等），在 6.8 上必然编译失败并让 apt 陷入
+# 半配置状态。BUILD_EXCLUSIVE_KERNEL 使 DKMS 对不匹配内核直接跳过。
+log_section "修补 System76 DKMS 模块内核版本门槛"
+
+for f in /usr/src/system76-*/dkms.conf /usr/src/system76_acpi-*/dkms.conf; do
+    [[ -f "$f" ]] || continue
+    if sudo grep -q '^BUILD_EXCLUSIVE_KERNEL' "$f"; then
+        log_info "$(basename "$(dirname "$f")") 已有版本门槛，跳过"
+    else
+        echo 'BUILD_EXCLUSIVE_KERNEL="^(6\.(1[1-9]|[2-9][0-9])|7\.|[89]\.)"' | sudo tee -a "$f" > /dev/null
+        log_success "已为 $(basename "$(dirname "$f")") 添加 BUILD_EXCLUSIVE_KERNEL（仅 ≥6.11 编译）"
+    fi
+done
+
+# ── 安装内核（幂等）──────────────────────────────────────────────────
+log_section "安装内核 ${TARGET_REL}"
+
+if [[ $(dpkg-query -W -f='${db:Status-Abbrev}' "linux-image-${TARGET_REL}" 2>/dev/null || true) == ii* ]]; then
+    log_info "内核 ${TARGET_REL} 已安装，跳过"
 else
-    log_info "HTTPS 连接 kernel.ubuntu.com 失败，回退使用 HTTP"
-    MAINLINE_BASE="http://kernel.ubuntu.com/mainline"
+    sudo apt-get -y install \
+        "linux-image-${TARGET_REL}" \
+        "linux-headers-${TARGET_REL}" \
+        "linux-modules-${TARGET_REL}" \
+        "linux-modules-extra-${TARGET_REL}"
+    log_success "内核 ${TARGET_REL} 安装完成"
 fi
 
-# ── 查找最新 6.6.x mainline 版本 ─────────────────────────
-log_section "查找 Ubuntu Mainline 6.6 最新版本"
+# ── 校验 NVIDIA DKMS 模块 ────────────────────────────────────────────
+log_section "校验 NVIDIA DKMS 模块"
 
-LATEST_TAG=$(curl -fsSL "${MAINLINE_BASE}/" \
-    | grep -oE 'v6\.6\.[0-9]+/' \
-    | grep -v '\-rc' \
-    | sort -V | tail -1 | tr -d '/')
-
-[[ -z "$LATEST_TAG" ]] && log_error "无法获取 6.6.x 版本列表" fatal
-log_info "最新版本：$LATEST_TAG"
-
-# ── 幂等性：已安装同版本则跳过下载和安装 ──────────────────
-# mainline 内核包名格式：linux-image-unsigned-6.6.87-060687-generic
-_kernel_installed() {
-    local ver="${LATEST_TAG#v}"
-    dpkg-query -W "linux-image-unsigned-${ver}*" 2>/dev/null | grep -qv '^$' && \
-    dpkg-query -W "linux-headers-${ver}*" 2>/dev/null | grep -qv '^$'
-}
-
-if _kernel_installed; then
-    log_info "内核 ${LATEST_TAG} 已安装，跳过下载安装"
+# 先捕获输出再 grep：pipefail 下 grep -q 提前退出会令上游收到
+# SIGPIPE（退出码 141），导致条件被误判为假
+DKMS_OUT=$(dkms status 2>/dev/null || true)
+if grep -qE "^nvidia/[^,]+, ${TARGET_REL}, .*: installed" <<<"$DKMS_OUT"; then
+    log_success "NVIDIA DKMS 模块已为 ${TARGET_REL} 编译安装"
 else
-    PKG_PAGE_URL="${MAINLINE_BASE}/${LATEST_TAG}/amd64/"
-
-    # ── 获取 .deb 文件列表 ────────────────────────────────────
-    log_section "获取安装包列表"
-
-    PKG_HTML=$(curl -fsSL "$PKG_PAGE_URL")
-
-    # 需要的四个包：all headers、amd64 headers、modules、image-unsigned
-    mapfile -t DEB_FILES < <(echo "$PKG_HTML" \
-        | grep -oE 'linux-(headers-[^"]+_all|headers-[^"]+_amd64|modules-[^"]+_amd64|image-unsigned-[^"]+_amd64)\.deb' \
-        | grep -v 'lowlatency\|snapdragon' \
-        | sort -u)
-
-    [[ ${#DEB_FILES[@]} -eq 0 ]] && log_error "未找到任何 .deb 包" fatal
-
-    for f in "${DEB_FILES[@]}"; do
-        log_info "  $f"
-    done
-
-    # ── 下载 ─────────────────────────────────────────────────
-    log_section "下载安装包"
-
-    TMP_DIR=$(mktemp -d)
-    trap 'rm -rf "$TMP_DIR"; kill "$SUDO_KEEP_ALIVE_PID" 2>/dev/null' EXIT INT TERM
-
-    for deb in "${DEB_FILES[@]}"; do
-        log_info "下载：$deb"
-        curl -fsSL --progress-bar "${PKG_PAGE_URL}${deb}" -o "${TMP_DIR}/${deb}"
-    done
-
-    # ── 安装 ─────────────────────────────────────────────────
-    log_section "安装内核"
-    # 按依赖顺序安装：all headers → amd64 headers → image → modules
-    _pick_deb() { printf '%s\n' "${DEB_FILES[@]}" | grep -E "$1" | head -1; }
-    ORDERED_DEBS=()
-    for pat in '_all\.deb$' 'headers.*_amd64\.deb$' 'image-unsigned.*_amd64\.deb$' 'modules.*_amd64\.deb$'; do
-        f=$(_pick_deb "$pat")
-        [[ -n "$f" ]] && ORDERED_DEBS+=("${TMP_DIR}/${f}")
-    done
-    [[ ${#ORDERED_DEBS[@]} -eq 0 ]] && log_error "无可安装的 .deb 包" fatal
-    sudo dpkg -i "${ORDERED_DEBS[@]}"
-
-    # ── 锁定，防止 apt 干预 ───────────────────────────────────
-    # 从文件名提取包名（去掉版本和架构后缀）
-    for deb in "${DEB_FILES[@]}"; do
-        PKG_NAME=$(echo "$deb" | grep -oE '^[^_]+')
-        sudo apt-mark hold "$PKG_NAME" 2>/dev/null || true
-    done
-    log_success "已锁定所有 mainline 包（apt-mark hold）"
+    log_error "NVIDIA DKMS 模块未在 ${TARGET_REL} 上编译成功" fatal
 fi
 
-# ── 获取已安装的内核版本（新装或已有均适用）────────────────
-log_section "确认内核版本"
+# ── 清理多余 Pop 内核（760-xxx 编号），为 6.8 腾出启动槽位 ────────────
+# kernelstub 只为"最新 + 次新"两个内核创建启动项；若保留两个以上
+# 7.x 内核，6.8 将排不进 ESP。全部 7.x 均 ≥6.11（睡眠已损坏），
+# 仅保留最新一个用于 A/B 对比。
+log_section "清理多余 Pop 内核"
 
-# mainline 内核版本格式：6.6.87-060687-generic
-VMLINUZ=$(ls -1 /boot/vmlinuz-6.6.*-generic 2>/dev/null | sort -V | tail -1)
-[[ -z "$VMLINUZ" ]] && log_error "找不到 /boot/vmlinuz-6.6.*-generic" fatal
-KERNEL_VER=$(basename "$VMLINUZ" | sed 's/^vmlinuz-//')
-log_info "安装的内核版本：$KERNEL_VER"
+mapfile -t POP_KERNELS < <(dpkg -l | awk \
+    '$1=="ii" && $2 ~ /^linux-image-[0-9.]+-760[0-9]+-generic$/ {print $2}' \
+    | sed -E 's/^linux-image-//; s/-generic$//' | sort -V)
 
-# ── 生成 grub.cfg ─────────────────────────────────────────
-log_section "生成 GRUB 配置"
-sudo update-grub 2>/dev/null
-
-# ── 读取子菜单标题并验证入口 ──────────────────────────────
-# 动态查找包含该内核版本的 menuentry 标题（兼容单/双引号，排除 recovery 条目）
-ENTRY_TITLE=$(sudo grep "menuentry .*${KERNEL_VER}" "$GRUB_CFG" \
-    | grep -v -i 'recovery\|rescue' \
-    | head -1 \
-    | sed -E "s/.*menuentry ['\"]([^'\"]+)['\"].*/\1/" || true)
-if [[ -z "$ENTRY_TITLE" ]]; then
-    log_error "grub.cfg 中未找到内核 ${KERNEL_VER} 的 menuentry" fatal
-fi
-log_info "找到 GRUB 条目：$ENTRY_TITLE"
-
-# 解析 submenu 标题（兼容单/双引号）；无 submenu 时直接用条目标题
-SUBMENU_TITLE=$(sudo grep -m1 "^submenu " "$GRUB_CFG" \
-    | sed -E "s/^submenu ['\"]([^'\"]+)['\"].*/\1/" || true)
-if [[ -n "$SUBMENU_TITLE" ]]; then
-    GRUB_DEFAULT_VAL="${SUBMENU_TITLE}>${ENTRY_TITLE}"
+if [[ ${#POP_KERNELS[@]} -le 1 ]]; then
+    log_info "最多只剩 1 个 Pop 内核（${POP_KERNELS[*]:-无}），无需清理"
 else
-    log_info "grub.cfg 中无 submenu，直接使用条目标题"
-    GRUB_DEFAULT_VAL="$ENTRY_TITLE"
+    KEEP="${POP_KERNELS[-1]}"
+    log_info "保留最新 Pop 内核：${KEEP}"
+    for ver in "${POP_KERNELS[@]}"; do
+        [[ "$ver" == "$KEEP" ]] && continue
+        esc=${ver//./\\.}
+        mapfile -t PKGS < <(dpkg -l | awk -v re="(^|-)${esc}(-generic)?$" \
+            '$1=="ii" && $2 ~ /^linux-(image|headers|modules)/ && $2 ~ re {print $2}')
+        if [[ ${#PKGS[@]} -gt 0 ]]; then
+            [[ "$ver" == "$(uname -r | sed 's/-generic$//')" ]] \
+                && log_info "注意：正在卸载当前运行中的内核 ${ver}，卸载后请勿再切换回该内核"
+            log_info "卸载内核 ${ver}（${#PKGS[@]} 个包）"
+            sudo apt-get -y purge "${PKGS[@]}"
+        fi
+    done
 fi
-log_info "GRUB_DEFAULT → $GRUB_DEFAULT_VAL"
 
-# ── 写入 /etc/default/grub ────────────────────────────────
-log_section "配置 /etc/default/grub"
-sudo cp "$GRUB_DEFAULT_FILE" "${GRUB_DEFAULT_FILE}.bak"
-sudo sed -i "s|^GRUB_DEFAULT=.*|GRUB_DEFAULT=\"${GRUB_DEFAULT_VAL}\"|" "$GRUB_DEFAULT_FILE"
-sudo sed -i 's|^GRUB_SAVEDEFAULT=.*|# GRUB_SAVEDEFAULT=|' "$GRUB_DEFAULT_FILE"
-sudo update-grub 2>/dev/null
-log_success "GRUB 已更新，默认引导 Linux ${KERNEL_VER}"
+# ── 收尾 dpkg 状态 + 刷新 ESP 启动项 ─────────────────────────────────
+log_section "刷新启动项"
 
-# ── 安装后钩子：重新运行脚本后自动更新 GRUB_DEFAULT ───────
-log_section "添加内核安装后钩子"
+sudo dpkg --configure -a || true
+sudo kernelstub
 
-sudo tee /etc/kernel/postinst.d/zz-prefer-mainline-66-kernel > /dev/null <<'HOOK'
-#!/bin/bash
-# 当新的 6.6.x mainline 内核安装时，自动更新 GRUB_DEFAULT
-KERNEL_VERSION="$1"
-GRUB_DEFAULT_FILE="/etc/default/grub"
-GRUB_CFG="/boot/grub/grub.cfg"
-
-# mainline 格式：6.6.x-06066x-generic
-[[ "$KERNEL_VERSION" != 6.6.*-*-generic ]] && exit 0
-
-update-grub 2>/dev/null
-
-# 动态查找 menuentry 标题（兼容单/双引号，排除 recovery）
-ENTRY_TITLE=$(grep "menuentry .*${KERNEL_VERSION}" "$GRUB_CFG" \
-    | grep -v -i 'recovery\|rescue' \
-    | head -1 \
-    | sed -E "s/.*menuentry ['\"]([^'\"]+)['\"].*/\1/" || true)
-[[ -z "$ENTRY_TITLE" ]] && ENTRY_TITLE="Debian GNU/Linux, with Linux ${KERNEL_VERSION}"
-
-# 解析 submenu 标题（兼容单/双引号）；无 submenu 时直接用条目标题
-SUBMENU_TITLE=$(grep -m1 "^submenu " "$GRUB_CFG" \
-    | sed -E "s/^submenu ['\"]([^'\"]+)['\"].*/\1/" || true)
-if [[ -n "$SUBMENU_TITLE" ]]; then
-    GRUB_DEFAULT_VAL="${SUBMENU_TITLE}>${ENTRY_TITLE}"
+REMAIN_7X=$(dpkg -l | awk \
+    '$1=="ii" && $2 ~ /^linux-image-[0-9.]+-760[0-9]+-generic$/' | wc -l)
+if (( REMAIN_7X > 0 )); then
+    # kernelstub：最新内核 → Pop_OS-current，次新（6.8）→ Pop_OS-oldkern
+    DEFAULT_ENTRY="Pop_OS-oldkern.conf"
 else
-    GRUB_DEFAULT_VAL="$ENTRY_TITLE"
+    DEFAULT_ENTRY="Pop_OS-current.conf"
 fi
+log_info "设置默认引导项：${DEFAULT_ENTRY}"
 
-sed -i "s|^GRUB_DEFAULT=.*|GRUB_DEFAULT=\"${GRUB_DEFAULT_VAL}\"|" "$GRUB_DEFAULT_FILE"
-update-grub 2>/dev/null
-HOOK
+sudo bootctl set-default "$DEFAULT_ENTRY" || true
+BOOTCTL_LIST=$(sudo bootctl list --no-pager 2>/dev/null || true)
+if ! grep -qF "${DEFAULT_ENTRY}) (default)" <<<"$BOOTCTL_LIST"; then
+    # bootctl set-default 偶发静默失败，直接改 loader.conf 兜底
+    log_info "bootctl 设置未生效，直接修改 loader.conf"
+    if sudo grep -q '^default' /boot/efi/loader/loader.conf; then
+        sudo sed -i "s/^default .*/default ${DEFAULT_ENTRY%.conf}/" /boot/efi/loader/loader.conf
+    else
+        echo "default ${DEFAULT_ENTRY%.conf}" | sudo tee -a /boot/efi/loader/loader.conf > /dev/null
+    fi
+    sudo grep -q '^timeout' /boot/efi/loader/loader.conf \
+        || echo "timeout 3" | sudo tee -a /boot/efi/loader/loader.conf > /dev/null
+fi
+sudo bootctl set-timeout 3
+sudo cat /boot/efi/loader/loader.conf
+sudo bootctl list --no-pager 2>/dev/null | grep -E 'default\)|selected\)' || true
 
-sudo chmod +x /etc/kernel/postinst.d/zz-prefer-mainline-66-kernel
-log_success "已添加 /etc/kernel/postinst.d/zz-prefer-mainline-66-kernel"
+# ── 锁定 meta 包，防止 apt 拉回 7.x ──────────────────────────────────
+log_section "锁定内核 meta 包"
 
-log_success "完成，重启后将使用 Linux ${KERNEL_VER}（Ubuntu Mainline）"
+# Pop /release 仓库（优先级 1001）把三个 meta 全部劫持为 7.x，若不
+# hold，apt upgrade 会顺着 meta 依赖把 7.x 内核链条重新装回来
+for meta in linux-generic linux-image-generic linux-headers-generic; do
+    sudo apt-mark hold "$meta" > /dev/null
+done
+log_success "已锁定：$(apt-mark showhold | tr '\n' ' ')"
+
+# ── 完成报告 ─────────────────────────────────────────────────────────
+log_section "完成"
+log_success "内核 ${TARGET_REL} 已就绪并设为默认引导"
+log_info "重启后请确认：uname -r 输出 ${TARGET_REL}"
+log_info "随后测试睡眠唤醒与重启；确认稳定后可清理 7.x 内核（先降级被"
+log_info "Pop 劫持的 meta 到 6.8，解除依赖后再卸载 7.x）："
+cat <<'HINT'
+  sudo apt-mark unhold linux-generic linux-image-generic linux-headers-generic
+  sudo apt install linux-image-generic=6.8.0-139.139 linux-headers-generic=6.8.0-139.139 linux-generic=6.8.0-139.139
+  sudo apt purge $(dpkg -l | awk '/^ii/ && $2 ~ /760[0-9]+/ && $2 ~ /^linux-(image|headers|modules)/ {print $2}')
+  sudo kernelstub
+HINT

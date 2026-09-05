@@ -1,4 +1,5 @@
 #!/bin/bash
+# Pop!_OS 24.04 初始化主入口
 # 去掉 -e，让单步失败不中断整体流程；保留 -uo pipefail 捕获变量未定义和管道错误
 
 # 必须用 bash 运行，不兼容 sh/dash
@@ -12,38 +13,30 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/utils.sh"
 
+# 仅适用于 Pop!_OS
+grep -q '^ID=pop' /etc/os-release 2>/dev/null || {
+    echo "错误：本脚本仅适用于 Pop!_OS（/etc/os-release 中未检测到 ID=pop）" >&2
+    exit 1
+}
+
 check_sudo
-progress_init 17
+progress_init 13
 
 # ── 系统更新 ──────────────────────────────────────────────
 log_section "系统更新"
-sudo apt update
-sudo apt upgrade -y && sudo apt dist-upgrade -y
-sudo apt install -y zsh git curl wget ca-certificates flatpak gnome-software-plugin-flatpak \
+sudo apt-get update
+sudo apt-get upgrade -y && sudo apt-get dist-upgrade -y \
+    || record_failure "系统更新"
+sudo apt-get install -y zsh git curl wget ca-certificates flatpak \
     build-essential cmake pkg-config \
     fonts-noto-cjk fonts-noto-cjk-extra \
-    default-jdk ncurses-bin
+    default-jdk ncurses-bin \
+    || record_failure "基础包安装"
 progress_tick
 
 # ── 目录 ─────────────────────────────────────────────────
 log_section "创建目录"
 mkdir -p ~/Desktop/{source,work,caffe,learn}
-
-# Debian 默认不把 /usr/sbin 加入普通用户 PATH，写入 profile.d 全局生效
-if [[ ! -f /etc/profile.d/sbin-path.sh ]]; then
-    sudo tee /etc/profile.d/sbin-path.sh > /dev/null <<'EOF'
-# Ensure /usr/local/sbin and /usr/sbin are in PATH for all users
-for _sbin_dir in /usr/local/sbin /usr/sbin; do
-    case ":${PATH}:" in
-        *:"${_sbin_dir}":*) ;;
-        *) export PATH="${PATH}:${_sbin_dir}" ;;
-    esac
-done
-unset _sbin_dir
-EOF
-    sudo chmod +x /etc/profile.d/sbin-path.sh
-fi
-progress_tick
 
 # ── Git ──────────────────────────────────────────────────
 log_section "Git 全局配置"
@@ -69,19 +62,21 @@ git_clone_or_skip https://github.com/ypli0629/astronvim_config.git ~/.config/nvi
 progress_tick
 
 # ── Docker Engine ─────────────────────────────────────────
+# Pop!_OS 无官方 Docker 源，使用 Ubuntu 仓库（VERSION_CODENAME=noble 兼容）
 log_section "Docker Engine"
 if dpkg-query -W -f='${Status}' docker-ce 2>/dev/null | grep -q "install ok installed"; then
     log_info "Docker Engine 已安装，跳过"
 else
     sudo install -m 0755 -d /etc/apt/keyrings
-    sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+    sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
     sudo chmod a+r /etc/apt/keyrings/docker.asc
     echo \
-        "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian \
+        "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
     $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
         | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
     sudo apt-get update
-    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+        || record_failure "Docker Engine"
     sudo usermod -aG docker "$USER"
 fi
 progress_tick
@@ -103,20 +98,20 @@ fi
 progress_tick
 
 # ── Clash Verge Rev ──────────────────────────────────────
-log_section "Clash Verge Rev"
-if dpkg-query -W -f='${Status}' clash-verge 2>/dev/null | grep -q "install ok installed"; then
-    log_info "Clash Verge 已安装，跳过"
-else
-    CLASH_VERGE_URL="https://github.com/clash-verge-rev/clash-verge-rev/releases/download/v2.4.6/Clash.Verge_2.4.6_amd64.deb"
-    if gh_wget "$CLASH_VERGE_URL" /tmp/clash-verge.deb; then
-        sudo apt install -y /tmp/clash-verge.deb \
-            && log_success "Clash Verge 安装完成" \
-            || record_failure "Clash Verge Rev" "apt install 失败"
-    else
-        record_failure "Clash Verge Rev" "下载失败"
-    fi
-fi
-progress_tick
+#log_section "Clash Verge Rev"
+#if dpkg-query -W -f='${Status}' clash-verge 2>/dev/null | grep -q "install ok installed"; then
+#    log_info "Clash Verge 已安装，跳过"
+#else
+#    CLASH_VERGE_URL="https://github.com/clash-verge-rev/clash-verge-rev/releases/download/v2.4.6/Clash.Verge_2.4.6_amd64.deb"
+#    if gh_wget "$CLASH_VERGE_URL" /tmp/clash-verge.deb; then
+#        sudo apt install -y /tmp/clash-verge.deb \
+#            && log_success "Clash Verge 安装完成" \
+#            || record_failure "Clash Verge Rev" "apt install 失败"
+#    else
+#        record_failure "Clash Verge Rev" "下载失败"
+#    fi
+#fi
+#progress_tick
 
 # ── SwitchHosts ──────────────────────────────────────────
 log_section "SwitchHosts"
@@ -163,21 +158,18 @@ fi
 progress_tick
 
 # ── 子脚本 ────────────────────────────────────────────────
-# nvidia.sh 需重启进入新内核后手动执行
 log_section "执行子脚本"
-bash "$SCRIPT_DIR/scripts/kernel.sh"   || record_failure "kernel.sh"
+# kernel.sh 会安装 6.8 内核并设为默认引导（修复 kernel ≥6.11 与
+# NVIDIA 模块的睡眠/重启回归），重启后生效；NVIDIA DKMS 校验由其内部完成
+bash "$SCRIPT_DIR/scripts/kernel.sh"  || record_failure "kernel.sh"
 progress_tick
-bash "$SCRIPT_DIR/scripts/brew.sh"     || record_failure "brew.sh"
+bash "$SCRIPT_DIR/scripts/brew.sh"    || record_failure "brew.sh"
 progress_tick
-bash "$SCRIPT_DIR/scripts/zsh.sh"      || record_failure "zsh.sh"
+bash "$SCRIPT_DIR/scripts/zsh.sh"     || record_failure "zsh.sh"
 progress_tick
-bash "$SCRIPT_DIR/scripts/fcitx.sh"    || record_failure "fcitx.sh"
+bash "$SCRIPT_DIR/scripts/fcitx.sh"   || record_failure "fcitx.sh"
 progress_tick
-bash "$SCRIPT_DIR/scripts/gnome.sh"    || record_failure "gnome.sh"
-progress_tick
-bash "$SCRIPT_DIR/scripts/theme.sh"    || record_failure "theme.sh"
-progress_tick
-bash "$SCRIPT_DIR/scripts/flatpak.sh"  || record_failure "flatpak.sh"
+bash "$SCRIPT_DIR/scripts/flatpak.sh" || record_failure "flatpak.sh"
 progress_tick
 
 # ── 安装报告 ──────────────────────────────────────────────
@@ -185,6 +177,3 @@ log_section "安装报告"
 print_report
 log_success "完成！请重启系统以使所有配置生效。"
 echo ""
-log_info "后续手动步骤："
-log_info "  1. 重启进入 mainline 6.6 内核"
-log_info "  2. bash scripts/nvidia.sh   # 安装 NVIDIA 驱动"
