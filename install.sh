@@ -138,16 +138,22 @@ else
     TOOLBOX_URL=$(curl -fsSL \
         "https://data.services.jetbrains.com/products/releases?code=TBA&latest=true&type=release" \
         | grep -oE 'https://download\.jetbrains\.com/toolbox/jetbrains-toolbox-[^"]+\.tar\.gz' \
+        | grep -v -- '-arm64' \
         | head -1) || TOOLBOX_URL=""
     if [[ -n "$TOOLBOX_URL" ]]; then
         if wget --timeout=60 -q -O /tmp/jetbrains-toolbox.tar.gz "$TOOLBOX_URL"; then
             mkdir -p "$HOME/.local/bin"
             tar -xzf /tmp/jetbrains-toolbox.tar.gz -C /tmp/
-            find /tmp -maxdepth 2 -name "jetbrains-toolbox" -type f \
-                | head -1 | xargs -I{} mv {} "$TOOLBOX_BIN"
-            chmod +x "$TOOLBOX_BIN"
-            rm -f /tmp/jetbrains-toolbox.tar.gz
-            log_success "JetBrains Toolbox 已安装至 $TOOLBOX_BIN，首次运行请在桌面环境执行"
+            # 3.x 起二进制位于 bin/ 子目录（深度 3），-r 防止空输入时误执行
+            find /tmp -maxdepth 3 -name "jetbrains-toolbox" -type f \
+                | head -1 | xargs -r -I{} mv {} "$TOOLBOX_BIN"
+            if [[ ! -x "$TOOLBOX_BIN" ]]; then
+                record_failure "JetBrains Toolbox" "解压后未找到可执行文件"
+            else
+                chmod +x "$TOOLBOX_BIN"
+                rm -rf /tmp/jetbrains-toolbox-* /tmp/jetbrains-toolbox.tar.gz
+                log_success "JetBrains Toolbox 已安装至 $TOOLBOX_BIN，首次运行请在桌面环境执行"
+            fi
         else
             record_failure "JetBrains Toolbox" "下载失败"
         fi
