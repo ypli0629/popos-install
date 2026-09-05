@@ -142,17 +142,19 @@ else
         | head -1) || TOOLBOX_URL=""
     if [[ -n "$TOOLBOX_URL" ]]; then
         if wget --timeout=60 -q -O /tmp/jetbrains-toolbox.tar.gz "$TOOLBOX_URL"; then
-            mkdir -p "$HOME/.local/bin"
             tar -xzf /tmp/jetbrains-toolbox.tar.gz -C /tmp/
-            # 3.x 起二进制位于 bin/ 子目录（深度 3），-r 防止空输入时误执行
-            find /tmp -maxdepth 3 -name "jetbrains-toolbox" -type f \
-                | head -1 | xargs -r -I{} mv {} "$TOOLBOX_BIN"
-            if [[ ! -x "$TOOLBOX_BIN" ]]; then
-                record_failure "JetBrains Toolbox" "解压后未找到可执行文件"
-            else
-                chmod +x "$TOOLBOX_BIN"
+            # 3.x 起压缩包 bin/ 为完整应用（二进制 + 捆绑 jre/ + 库），
+            # 必须整体安装；只搬二进制会因找不到同级 jre 启动失败
+            EXTRACT_DIR=$(find /tmp -maxdepth 1 -type d -name 'jetbrains-toolbox-*' | head -1)
+            if [[ -n "$EXTRACT_DIR" && -d "$EXTRACT_DIR/bin" ]]; then
+                rm -rf "$HOME/.local/share/jetbrains-toolbox"
+                mkdir -p "$HOME/.local/share/jetbrains-toolbox" "$HOME/.local/bin"
+                cp -a "$EXTRACT_DIR/bin/." "$HOME/.local/share/jetbrains-toolbox/"
+                ln -sfn "$HOME/.local/share/jetbrains-toolbox/jetbrains-toolbox" "$TOOLBOX_BIN"
                 rm -rf /tmp/jetbrains-toolbox-* /tmp/jetbrains-toolbox.tar.gz
-                log_success "JetBrains Toolbox 已安装至 $TOOLBOX_BIN，首次运行请在桌面环境执行"
+                log_success "JetBrains Toolbox 已安装至 ~/.local/share/jetbrains-toolbox（入口：$TOOLBOX_BIN）"
+            else
+                record_failure "JetBrains Toolbox" "压缩包布局未知"
             fi
         else
             record_failure "JetBrains Toolbox" "下载失败"
